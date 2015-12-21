@@ -23,8 +23,9 @@
 #include <config.h>
 #include "neighbours.h"
 #include "syslog_syserror.h"
+
 #include <syslog.h>
-#include "sockaddr_helpers.h"
+#include "sockaddr_helpers.h" 
 #include "configuration.h"
 #include "mac_ntop.h"
 #include "host_lookup.h"
@@ -50,6 +51,12 @@
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <resolv.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/ip_icmp.h>
+
+
 
 #define LOOPBACK_NAME "lo"
 
@@ -136,7 +143,12 @@ typedef struct {
 } get_if_addr_list_cb_data_t;
 
 
-
+#define PACKETSIZE  64
+struct packet
+{
+    struct icmphdr hdr;
+    char msg[PACKETSIZE-sizeof(struct icmphdr)];
+};
 
 
 
@@ -1184,8 +1196,97 @@ static void print_if_list(FILE* subnet_fd, FILE* devices_fd, if_list_t if_list, 
 	}
 }
 
+
+/*--------------------------------------------------------------------*/
+/*--- checksum - standard 1s complement checksum                   ---*/
+/*--------------------------------------------------------------------*/
+unsigned short checksum(void *b, int len)
+{
+    unsigned short *buf = b;
+    unsigned int sum=0;
+    unsigned short result;
+
+    for ( sum = 0; len > 1; len -= 2 )
+        sum += *buf++;
+    if ( len == 1 )
+        sum += *(unsigned char*)buf;
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    result = ~sum;
+    return result;
+}
+
+
+/*----------------------------------------------------------------------------*/
+/*--- icmp_probe - Create icmp echo message and send to force arp response ---*/
+/*----------------------------------------------------------------------------*/
+int icmp_probe(char *ipaddress)
+{
+    const int val=255;
+    int sock;
+    int pid=-1;
+    int echo_cnt=1; 
+    int i;
+    struct protoent *proto=NULL;    
+    struct packet pckt;
+    struct sockaddr_in r_addr;
+    struct hostent *hname;
+    struct sockaddr_in addr_ping,*addr;
+
+    //setup socket
+    pid = getpid();
+    proto = getprotobyname("ICMP");
+    hname = gethostbyname(ipaddress);
+    bzero(&addr_ping, sizeof(addr_ping));
+    addr_ping.sin_family = hname->h_addrtype;
+    addr_ping.sin_port = 0;
+    addr_ping.sin_addr.s_addr = *(long*)hname->h_addr;
+
+    addr = &addr_ping;
+
+    sock = socket(PF_INET, SOCK_RAW, proto->p_proto);
+    if ( sock < 0 )
+    {
+        syslog_syserror(LOG_ALERT, "ICMP Socket Init Error");
+        return 0;
+    }
+    if ( setsockopt(sock, SOL_IP, IP_TTL, &val, sizeof(val)) != 0)
+    {
+	syslog_syserror(LOG_ALERT, "ICMP Set TTL option");
+        return 0;
+    }
+    if ( fcntl(sock, F_SETFL, O_NONBLOCK) != 0 )
+    {
+        syslog_syserror(LOG_ALERT, "ICMP Request nonblocking I/O");
+        return 0;
+    }
+    
+    //send icmp probe
+    bzero(&pckt, sizeof(pckt));
+    pckt.hdr.type = ICMP_ECHO;
+    pckt.hdr.un.echo.id = pid;
+    for (i = 0; i < sizeof(pckt.msg)-1; i++ )
+    {	pckt.msg[i] = i+'0';
+    }
+    pckt.msg[i] = 0;
+    pckt.hdr.un.echo.sequence = echo_cnt++;
+    pckt.hdr.checksum = checksum(&pckt, sizeof(pckt));
+    if ( sendto(sock, &pckt, sizeof(pckt), 0, (struct sockaddr*)addr, sizeof(*addr)) <= 0 )
+    {	syslog_syserror(LOG_ALERT, "ICMP SendTo Error");
+    }
+
+    //resource cleanup
+    close(sock);    
+
+    return 0;
+}
+
+
+
+
 static void scan_network(struct sockaddr* addr, uint8_t mask, int ifindex, struct mnl_socket* nl_sock)
 {
+
 	size_t remote_addr_size;
 	struct sockaddr* remote_addr;
 	if (addr->sa_family == AF_INET) {
@@ -1207,6 +1308,11 @@ static void scan_network(struct sockaddr* addr, uint8_t mask, int ifindex, struc
 		exit(EX_OSERR);
 	}
 	memset(remote_addr, 0, remote_addr_size);
+
+
+	//check netlink for each mac address
+	syslog(LOG_INFO, "Scan Subnet and Check Netlink for Mac Address");
+	
 	while (increment_addr(addr, mask, remote_addr) > 0) {
 		char* buf;
 		struct nlmsghdr* nl_head;
@@ -1221,7 +1327,13 @@ static void scan_network(struct sockaddr* addr, uint8_t mask, int ifindex, struc
 			syslog_syserror(LOG_EMERG, "Unable to allocate memory");
 			exit(EX_OSERR);
 		}
-	
+		
+		//send an icmp echo probe just before checking netlink to get an inventory
+		struct sockaddr_in* addr = (struct sockaddr_in*) remote_addr;
+		char *ip = inet_ntoa(addr->sin_addr);		
+		icmp_probe(ip);
+		
+		//check netlink for Mac Address
 		nl_head = mnl_nlmsg_put_header(buf);
 		nl_head->nlmsg_type = RTM_NEWNEIGH;
 		nl_head->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK;
@@ -1251,8 +1363,7 @@ static void scan_network(struct sockaddr* addr, uint8_t mask, int ifindex, struc
 			syslog(LOG_CRIT, "Unable to prepare netlink message with a placholder neighbour MAC address");
 			exit(EX_SOFTWARE);
 		}
-	
-	
+		
 		portid = mnl_socket_get_portid(nl_sock);
 	
 		if (mnl_socket_sendto(nl_sock, nl_head, nl_head->nlmsg_len) < 0) {
@@ -1273,6 +1384,8 @@ static void scan_network(struct sockaddr* addr, uint8_t mask, int ifindex, struc
 		free(buf);
 	}
 	free(remote_addr);
+
+
 }
 
 static void scan_networks(struct mnl_socket* nl_sock, if_list_t if_list, config_t* config)
@@ -1366,7 +1479,8 @@ void print_neighbours(config_t* config, FILE* subnet_fd, FILE* devices_fd)
 
 	scan_networks(nl_sock, if_list, config);
 
-	if (full_sleep(CONFIG_OPTION_SCAN_RESULT_TIMEOUT)) {
+	if (full_sleep(CONFIG_OPTION_SCAN_RESULT_TIMEOUT)) 
+	{
 		fprintf(subnet_fd, "[\"%s\"", config->session_id);
 		fprintf(devices_fd, "[\"%s\"", config->session_id);
 	
